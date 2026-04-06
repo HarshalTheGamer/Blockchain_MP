@@ -443,57 +443,53 @@ contract DonationContract {
 }
 ```
 
-### 6.2 DAO Governance Contract (`GovernanceDAO.sol`) — Security-Hardened v2
-
-> **All 5 reported vulnerabilities have been patched.** Each fix is individually annotated in the contract.
+### 6.2 DAO Governance Contract (`GovernanceDAO.sol`)
 
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 /**
- * @title GovernanceDAO  (Hardened v2)
- * @notice Decentralized Autonomous Organization for managing donation fund releases
+ * @title GovernanceDAO
+ * @notice DAO for managing donation fund releases via community voting.
  * @dev Covers: DAOs (Unit III - Layer 4), Smart Contracts (Unit II), Security (Unit IV)
  *
- * SECURITY FIXES APPLIED:
- *  FIX 1 — grantToken: onlyOwner access control (was open to anyone)
- *  FIX 2 — executeProposal: CEI pattern + nonReentrant (state updated BEFORE external call)
- *  FIX 3 — createProposal: validate campaignId exists on DonationContract
- *  FIX 4 — vote: uses snapshotted balance at proposal creation, not live balance
- *  FIX 5 — transferToken: tokens are transferable (not locked indefinitely)
+ * SECURITY FIXES:
+ *  FIX 1 - grantToken      : onlyOwner guard (was callable by anyone)
+ *  FIX 2 - executeProposal : CEI + nonReentrant (external call was before state update)
+ *  FIX 3 - createProposal  : campaignId validated on DonationContract (prevents front-running)
+ *  FIX 4 - vote            : balance snapshotted at proposal creation (prevents vote-buying)
+ *  FIX 5 - transferToken   : tokens transferable, not locked forever
  */
 contract GovernanceDAO {
 
-    // ─── STATE ───────────────────────────────────────────────────────────────
+    // ========== STATE ==========
     DonationInterface public donationContract;
     address           public owner;
     uint256           public proposalCount;
 
     uint256 public constant VOTING_PERIOD = 3 days;
-    uint256 public constant QUORUM        = 3;   // Minimum total weighted votes needed
+    uint256 public constant QUORUM        = 3;
 
     struct Proposal {
         uint256 id;
-        uint256 campaignId;       // Which donation campaign to release
+        uint256 campaignId;
         string  description;
         uint256 votesFor;
         uint256 votesAgainst;
-        uint256 deadline;         // Timestamp when voting ends
+        uint256 deadline;
         bool    executed;
         bool    passed;
         address proposer;
     }
 
-    mapping(uint256 => Proposal)                    public proposals;
-    mapping(uint256 => mapping(address => bool))    public hasVoted;
-    mapping(address => uint256)                     public tokenBalance;
-
-    // FIX 4: Snapshot token balances per proposal to prevent vote-buying
-    // proposalId => voter => snapshotted balance at proposal creation
+    mapping(uint256 => Proposal)                    public  proposals;
+    mapping(uint256 => mapping(address => bool))    public  hasVoted;
+    mapping(address => uint256)                     public  tokenBalance;
+    // FIX 4: per-proposal frozen voting power snapshot
     mapping(uint256 => mapping(address => uint256)) private _votingPower;
 
-    // ─── SECURITY: Reentrancy Guard ──────────────────────────────────────────
+    // ========== REENTRANCY GUARD (FIX 2) ==========
     bool private _locked;
     modifier nonReentrant() {
         require(!_locked, "Reentrancy: reentrant call");
@@ -502,93 +498,65 @@ contract GovernanceDAO {
         _locked = false;
     }
 
-    // ─── ACCESS CONTROL ──────────────────────────────────────────────────────
+    // ========== ACCESS CONTROL (FIX 1) ==========
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner allowed");
         _;
     }
 
-    // ─── EVENTS ──────────────────────────────────────────────────────────────
+    // ========== EVENTS ==========
     event TokenGranted(address indexed to, uint256 amount);
     event TokenTransferred(address indexed from, address indexed to, uint256 amount);
     event ProposalCreated(uint256 indexed id, uint256 campaignId, address indexed proposer);
     event Voted(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed proposalId, bool passed);
 
-    // ─── CONSTRUCTOR ─────────────────────────────────────────────────────────
+    // ========== CONSTRUCTOR ==========
     constructor(address _donationContract) {
-        require(_donationContract != address(0), "Invalid donation contract address");
+        require(_donationContract != address(0), "Invalid donation contract");
         donationContract = DonationInterface(_donationContract);
         owner = msg.sender;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // FIX 1 — ACCESS CONTROL on grantToken
-    // ════════════════════════════════════════════════════════════════════════
-    /**
-     * @notice Distribute governance tokens — ONLY the owner (deployer) can call this.
-     * @dev VULNERABILITY: Original had no modifier — any address could call
-     *      grantToken(attacker, 999999) to gain unlimited voting power, completely
-     *      breaking governance. onlyOwner restricts minting to the trusted admin.
-     */
+    // ========== FIX 1: ACCESS CONTROL on grantToken ==========
+    // Bug: no modifier -> anyone could grant themselves unlimited tokens.
+    // Fix: onlyOwner ensures only the deploying admin distributes tokens.
     function grantToken(address _to, uint256 _amount) external onlyOwner {
         require(_to != address(0), "Invalid address");
-        require(_amount > 0,       "Amount must be > 0");
+        require(_amount > 0, "Amount must be > 0");
         tokenBalance[_to] += _amount;
         emit TokenGranted(_to, _amount);
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // FIX 5 — WITHDRAWAL PATTERN (tokens transferable, not locked forever)
-    // ════════════════════════════════════════════════════════════════════════
-    /**
-     * @notice Transfer governance tokens to another address.
-     * @dev VULNERABILITY: Original had no transfer or burn — tokens were locked
-     *      indefinitely once granted. Holders can now transfer/delegate freely.
-     *      Note: transfers do NOT retroactively affect snapshotted voting power
-     *      in already-created proposals.
-     */
+    // ========== FIX 5: TOKEN TRANSFER (withdrawal pattern) ==========
+    // Bug: tokens permanently locked once granted (no transfer/burn existed).
+    // Fix: holders can transfer freely; does NOT affect existing vote snapshots.
     function transferToken(address _to, uint256 _amount) external {
-        require(_to != address(0),                   "Invalid recipient");
-        require(_amount > 0,                         "Amount must be > 0");
-        require(tokenBalance[msg.sender] >= _amount, "Insufficient token balance");
-        // CEI: state update before any side-effects
+        require(_to != address(0), "Invalid recipient");
+        require(_amount > 0, "Amount must be > 0");
+        require(tokenBalance[msg.sender] >= _amount, "Insufficient balance");
         tokenBalance[msg.sender] -= _amount;
         tokenBalance[_to]        += _amount;
         emit TokenTransferred(msg.sender, _to, _amount);
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // FIX 3 — CAMPAIGN VALIDATION  |  FIX 4 — VOTE SNAPSHOT
-    // ════════════════════════════════════════════════════════════════════════
-    /**
-     * @notice Create a proposal to release funds for a campaign.
-     *
-     * @dev FIX 3 — VULNERABILITY: Any arbitrary _campaignId could be passed,
-     *      including non-existent or future IDs. An attacker could front-run a
-     *      campaign creation and push a malicious proposal for campaignId N before
-     *      the legit campaign N is created.
-     *      FIX: donationContract.campaignExists(_campaignId) rejects invalid IDs.
-     *
-     *      FIX 4 — VULNERABILITY: vote() read tokenBalance[msg.sender] live,
-     *      so an attacker could buy large token position AFTER observing a new
-     *      proposal, vote with inflated weight, then immediately sell — all in
-     *      one block or across blocks within the voting window.
-     *      FIX: _votingPower[proposalId][voter] is frozen at proposal creation.
-     *      vote() uses this frozen snapshot, not current balance.
-     *
-     * @param _campaignId   ID of an existing, active campaign
-     * @param _description  Human-readable rationale for the proposal
-     * @param _voters       Full list of eligible voters to snapshot right now
-     */
+    // ========== FIX 3 + FIX 4: createProposal ==========
+    // FIX 3 Bug: any _campaignId accepted -> attacker front-runs with non-existent ID.
+    //   Fix: donationContract.campaignExists() rejects invalid/inactive campaigns.
+    // FIX 4 Bug: vote() used live tokenBalance -> buy tokens, inflate vote, sell.
+    //   Fix: _votingPower[pid][voter] frozen NOW for all _voters supplied.
+    //         Later token transfers have zero effect on this proposal.
+    // @param _campaignId  Must be an existing, active campaign
+    // @param _description Human-readable rationale
+    // @param _voters      ALL eligible voters whose balances are frozen here
     function createProposal(
         uint256            _campaignId,
         string   calldata  _description,
         address[] calldata _voters
     ) external {
-        require(tokenBalance[msg.sender] > 0, "Must hold governance token to propose");
+        require(tokenBalance[msg.sender] > 0, "Must hold governance token");
 
-        // FIX 3: Reject proposals for campaigns that do not exist or are already closed
+        // FIX 3: campaign must exist and be active on DonationContract
         require(
             donationContract.campaignExists(_campaignId),
             "Campaign does not exist or is not active"
@@ -608,8 +576,7 @@ contract GovernanceDAO {
             proposer:     msg.sender
         });
 
-        // FIX 4: Freeze each eligible voter's balance at this moment.
-        // Any future token transfers/purchases cannot influence this proposal.
+        // FIX 4: snapshot every eligible voter's current balance
         for (uint256 i = 0; i < _voters.length; i++) {
             address v = _voters[i];
             if (tokenBalance[v] > 0) {
@@ -621,80 +588,60 @@ contract GovernanceDAO {
         proposalCount++;
     }
 
-    // ─── VOTE ────────────────────────────────────────────────────────────────
-    /**
-     * @notice Cast a vote using your snapshotted voting power.
-     * @dev FIX 4: Uses _votingPower snapshot — NOT the live tokenBalance.
-     *      Prevents: acquire tokens → vote with large weight → sell tokens.
-     */
+    // ========== VOTE (uses FIX 4 snapshot, not live balance) ==========
     function vote(uint256 _proposalId, bool _support) external {
-        require(_proposalId < proposalCount,            "Proposal does not exist");
+        require(_proposalId < proposalCount, "Proposal does not exist");
         Proposal storage p = proposals[_proposalId];
-        require(block.timestamp < p.deadline,           "Voting period ended");
-        require(!hasVoted[_proposalId][msg.sender],     "Already voted");
+        require(block.timestamp < p.deadline, "Voting period ended");
+        require(!hasVoted[_proposalId][msg.sender], "Already voted");
 
-        // FIX 4: Read from the snapshot, not the live balance
+        // FIX 4: use frozen snapshot, not live tokenBalance
         uint256 power = _votingPower[_proposalId][msg.sender];
-        require(power > 0, "No voting power: not in snapshot for this proposal");
+        require(power > 0, "No voting power in this proposal snapshot");
 
         hasVoted[_proposalId][msg.sender] = true;
 
-        if (_support) {
-            p.votesFor     += power;
-        } else {
-            p.votesAgainst += power;
-        }
+        if (_support) { p.votesFor     += power; }
+        else          { p.votesAgainst += power; }
 
         emit Voted(_proposalId, msg.sender, _support, power);
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // FIX 2 — REENTRANCY: CEI Pattern + nonReentrant in executeProposal
-    // ════════════════════════════════════════════════════════════════════════
-    /**
-     * @notice Execute a proposal after its voting period ends.
-     * @dev VULNERABILITY: Original called donationContract.releaseFunds() while
-     *      p.executed was still false. A malicious donation contract could re-enter
-     *      executeProposal() before p.executed was set, running the proposal
-     *      multiple times and repeatedly releasing funds.
-     *
-     *      FIX: Strict Checks-Effects-Interactions (CEI) pattern:
-     *        1. CHECKS      — all require() guards at the top
-     *        2. EFFECTS     — p.executed and p.passed set BEFORE external call
-     *        3. INTERACTIONS — releaseFunds() called LAST after state is finalized
-     *      The nonReentrant mutex provides a second, independent defence layer.
-     */
+    // ========== FIX 2: executeProposal with CEI + nonReentrant ==========
+    // Bug: releaseFunds() called while p.executed was still false ->
+    //   malicious contract re-enters executeProposal repeatedly, draining funds.
+    // Fix: strict Checks-Effects-Interactions (CEI) order:
+    //   1. CHECKS      - all require() guards at the top
+    //   2. EFFECTS     - p.executed and p.passed written BEFORE external call
+    //   3. INTERACTIONS - releaseFunds() is the very last operation
+    // nonReentrant mutex is an independent second layer of defence.
     function executeProposal(uint256 _proposalId) external nonReentrant {
         require(_proposalId < proposalCount, "Proposal does not exist");
         Proposal storage p = proposals[_proposalId];
 
         // 1. CHECKS
         require(block.timestamp >= p.deadline, "Voting still ongoing");
-        require(!p.executed,                   "Already executed");
-        uint256 totalVotes = p.votesFor + p.votesAgainst;
-        require(totalVotes >= QUORUM,          "Quorum not reached");
+        require(!p.executed, "Already executed");
+        require(p.votesFor + p.votesAgainst >= QUORUM, "Quorum not reached");
 
-        // 2. EFFECTS — ALL state changes happen BEFORE the external interaction
+        // 2. EFFECTS - state fully updated BEFORE external interaction
         p.executed = true;
         p.passed   = p.votesFor > p.votesAgainst;
-
-        // Emit event before external call so it is always logged even if call reverts
         emit ProposalExecuted(_proposalId, p.passed);
 
-        // 3. INTERACTIONS — external call is the very last operation
+        // 3. INTERACTIONS - external call is the very last action
         if (p.passed) {
             donationContract.releaseFunds(p.campaignId);
         }
     }
 
-    // ─── VIEW FUNCTIONS ──────────────────────────────────────────────────────
-
+    // ========== VIEW FUNCTIONS ==========
     function getProposal(uint256 _id) external view returns (Proposal memory) {
         require(_id < proposalCount, "Proposal does not exist");
         return proposals[_id];
     }
 
-    /// @notice Returns the snapshotted voting power for a voter on a given proposal
+    /// @notice Returns frozen voting power for a voter on a specific proposal
     function getVotingPower(uint256 _proposalId, address _voter)
         external view returns (uint256)
     {
@@ -702,131 +649,16 @@ contract GovernanceDAO {
     }
 }
 
-// ─── EXTENDED INTERFACE ───────────────────────────────────────────────────────
-// campaignExists() is required by FIX 3 — add it to DonationContract.sol
+// ========== INTERFACE ==========
+// Also add this function to DonationContract.sol to support FIX 3:
+//
+//   function campaignExists(uint256 _id) external view returns (bool) {
+//       return _id < campaignCount && campaigns[_id].isActive;
+//   }
+//
 interface DonationInterface {
     function releaseFunds(uint256 _campaignId) external;
     function campaignExists(uint256 _campaignId) external view returns (bool);
-}
-```
-
-> **⚠️ Required addition to `DonationContract.sol`** — add this one function so the DAO's FIX 3 can validate campaigns:
-> ```solidity
-> /// @notice Used by GovernanceDAO to validate a campaign before creating a proposal
-> function campaignExists(uint256 _id) external view returns (bool) {
->     return _id < campaignCount && campaigns[_id].isActive;
-> }
-> ```
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-/**
- * @title GovernanceDAO
- * @notice Decentralized Autonomous Organization for managing donation fund releases
- * @dev Covers: DAOs (Unit III - Layer 4), Smart Contracts (Unit II)
- * Token holders create proposals and vote to approve/reject fund releases
- */
-contract GovernanceDAO {
-
-    DonationInterface public donationContract;
-
-    struct Proposal {
-        uint256 id;
-        uint256 campaignId;         // Which donation campaign to release
-        string  description;
-        uint256 votesFor;
-        uint256 votesAgainst;
-        uint256 deadline;           // Timestamp when voting ends
-        bool    executed;
-        bool    passed;
-        address proposer;
-    }
-
-    mapping(uint256 => Proposal)                 public proposals;
-    mapping(uint256 => mapping(address => bool)) public hasVoted;   // proposalId => voter => voted
-    mapping(address => uint256)                  public tokenBalance; // Governance tokens
-    uint256 public proposalCount;
-    uint256 public constant VOTING_PERIOD = 3 days;
-    uint256 public constant QUORUM       = 3;  // Minimum votes needed
-
-    event ProposalCreated(uint256 id, uint256 campaignId, address proposer);
-    event Voted(uint256 proposalId, address voter, bool support);
-    event ProposalExecuted(uint256 proposalId, bool passed);
-
-    constructor(address _donationContract) {
-        donationContract = DonationInterface(_donationContract);
-    }
-
-    // Distribute governance tokens (simplified — in production use ERC-20)
-    function grantToken(address _to, uint256 _amount) external {
-        tokenBalance[_to] += _amount;
-    }
-
-    function createProposal(uint256 _campaignId, string calldata _description) external {
-        require(tokenBalance[msg.sender] > 0, "Must hold governance token to propose");
-
-        proposals[proposalCount] = Proposal({
-            id:          proposalCount,
-            campaignId:  _campaignId,
-            description: _description,
-            votesFor:    0,
-            votesAgainst: 0,
-            deadline:    block.timestamp + VOTING_PERIOD,
-            executed:    false,
-            passed:      false,
-            proposer:    msg.sender
-        });
-
-        emit ProposalCreated(proposalCount, _campaignId, msg.sender);
-        proposalCount++;
-    }
-
-    function vote(uint256 _proposalId, bool _support) external {
-        Proposal storage p = proposals[_proposalId];
-        require(block.timestamp < p.deadline,    "Voting period ended");
-        require(tokenBalance[msg.sender] > 0,    "No governance tokens");
-        require(!hasVoted[_proposalId][msg.sender], "Already voted");
-
-        hasVoted[_proposalId][msg.sender] = true;
-
-        if (_support) {
-            p.votesFor += tokenBalance[msg.sender];
-        } else {
-            p.votesAgainst += tokenBalance[msg.sender];
-        }
-
-        emit Voted(_proposalId, msg.sender, _support);
-    }
-
-    function executeProposal(uint256 _proposalId) external {
-        Proposal storage p = proposals[_proposalId];
-        require(block.timestamp >= p.deadline, "Voting still ongoing");
-        require(!p.executed,                   "Already executed");
-
-        uint256 totalVotes = p.votesFor + p.votesAgainst;
-        require(totalVotes >= QUORUM,           "Quorum not reached");
-
-        p.executed = true;
-        p.passed   = p.votesFor > p.votesAgainst;
-
-        if (p.passed) {
-            // Trigger fund release in DonationContract
-            donationContract.releaseFunds(p.campaignId);
-        }
-
-        emit ProposalExecuted(_proposalId, p.passed);
-    }
-
-    function getProposal(uint256 _id) external view returns (Proposal memory) {
-        return proposals[_id];
-    }
-}
-
-// Minimal interface to call DonationContract from DAO
-interface DonationInterface {
-    function releaseFunds(uint256 _campaignId) external;
 }
 ```
 
